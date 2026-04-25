@@ -1,0 +1,17 @@
+{
+  "name": "naver-blog-generator",
+  "version": "1.0.0",
+  "description": "네이버 블로그 글 자동 생성기",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "cheerio": "^1.0.0-rc.12"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
