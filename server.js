@@ -1,297 +1,379 @@
-const express = require("express");
-const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-const cheerio = require("cheerio");
-const path = require("path");
+const express = require('express');
+const cors = require('cors');
+const cheerio = require('cheerio');
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+const path = require('path');
+const { OpenAI } = require('openai');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, 'public')));
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const jobs = new Map();
-
-// 헬스체크
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// 헤더 설정
-const NAV_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-  "Accept-Language": "ko-KR,ko;q=0.9",
-  "Referer": "https://www.naver.com/",
-};
+const jobs = new Map();
 
-// HTML 가져오기
-async function fetchHtml(url) {
-  try {
-    const res = await fetch(url, { headers: NAV_HEADERS, timeout: 8000 });
-    if (!res.ok) return "";
-    return await res.text();
-  } catch { return ""; }
+// ── 유틸 ──────────────────────────────────────────────
+
+function isSj(line) {
+  const t = line.trim();
+  if (!t || t.length < 5 || t.length > 35) return false;
+  if (/[.。]$/.test(t)) return false;
+  const skipWords = ['#','http','스푼','오늘도','함께','여러분','오늘'];
+  if (skipWords.some(w => t.startsWith(w))) return false;
+  if (/^\d+[.。]\s/.test(t)) return false;
+  return true;
 }
 
-// 기사 내용 추출
-async function extractArticle(url) {
-  const html = await fetchHtml(url);
-  if (!html) return { title: "", content: "" };
-  const $ = cheerio.load(html);
-  const title =
-    $("meta[property='og:title']").attr("content") ||
-    $("h1").first().text() ||
-    $("title").text() || "";
-  const content =
-    $("#articleBodyContents").text() ||
-    $("article").text() ||
-    $(".article_body").text() ||
-    $("div#content").text() || "";
+function postProcessBody(text) {
+  if (!text) return text;
+
+  // 불필요한 태그 제거
+  text = text.replace(/^\[(.+)\]$/gm, '$1');
+  text = text.replace(/^소제목\s*[(\uff08][^)\uff09]*[)\uff09]\s*$/gm, '');
+  text = text.replace(/^소제목\s*/gm, '');
+  text = text.replace(/^\d+[.。]\s+/gm, '');
+
+  const lines = text.split('\n');
+  const result = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+
+    if (isSj(trimmed)) {
+      if (result.length > 0 && result[result.length - 1] !== '') result.push('');
+      result.push(trimmed);
+      result.push('');
+    } else {
+      result.push(lines[i]);
+    }
+  }
+
+  // 연속 빈줄 제거
+  const final = [];
+  for (let i = 0; i < result.length; i++) {
+    if (result[i] === '' && final[final.length - 1] === '') continue;
+    final.push(result[i]);
+  }
+
+  return final.join('\n').trim();
+}
+
+function cleanHashtags(raw, keyword) {
+  if (!raw) return `#${keyword}`;
+  const tags = raw.split(/[\s,]+/).filter(t => t.startsWith('#'));
+  const unique = [...new Set(tags)];
+  if (!unique.includes(`#${keyword}`)) unique.unshift(`#${keyword}`);
+  return unique.slice(0, 15).join(' ');
+}
+
+function countChars(text) {
+  const beforeSection = text.split('함께 읽으면 좋은 글')[0];
   return {
-    title: title.trim().slice(0, 200),
-    content: content.replace(/\s+/g, " ").trim().slice(0, 3000),
+    withSpace: beforeSection.length,
+    noSpace: beforeSection.replace(/\s/g, '').length
   };
 }
 
-// 관련 URL 제목 가져오기
-async function fetchPageTitle(url) {
-  try {
-    const html = await fetchHtml(url);
-    if (!html) return "";
-    const $ = cheerio.load(html);
-    return (
-      $("meta[property='og:title']").attr("content") ||
-      $("title").text() || ""
-    ).trim().slice(0, 100);
-  } catch { return ""; }
-}
+// ── 기사 크롤링 ────────────────────────────────────────
 
-// Gemini API 호출
-async function callGemini(prompt) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.9, maxOutputTokens: 4096 },
-      }),
-    }
-  );
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini API 오류 (${res.status}): ${err.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-}
-
-// 이미지 유효성 검사
-async function isValidImage(url) {
+async function fetchArticle(url) {
   try {
     const res = await fetch(url, {
-      method: "HEAD",
-      headers: { ...NAV_HEADERS, Referer: "https://blog.naver.com/" },
-      timeout: 4000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'ko-KR,ko;q=0.9',
+      },
+      timeout: 8000,
     });
-    if (!res.ok) return false;
-    const ct = res.headers.get("content-type") || "";
-    const cl = parseInt(res.headers.get("content-length") || "0");
-    return ct.startsWith("image/") && (cl === 0 || cl > 4096);
-  } catch { return false; }
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    const title =
+      $('meta[property="og:title"]').attr('content') ||
+      $('h1').first().text() ||
+      $('title').text() || '';
+
+    const content =
+      $('#dic_area').text() ||
+      $('#articleBodyContents').text() ||
+      $('article').text() ||
+      $('.article_body').text() || '';
+
+    const images = [];
+    $('img').each((_, el) => {
+      const src = $(el).attr('src') || $(el).attr('data-src') || '';
+      if (src && src.startsWith('http') && !src.includes('icon') && !src.includes('logo')) {
+        images.push(src);
+      }
+    });
+
+    return {
+      title: title.trim().slice(0, 200),
+      content: content.replace(/\s+/g, ' ').trim().slice(0, 3000),
+      images: images.slice(0, 10),
+    };
+  } catch {
+    return { title: '', content: '', images: [] };
+  }
 }
 
-// 이미지 필터링
+// ── 이미지 수집 ────────────────────────────────────────
+
 function isValidImageUrl(src) {
-  if (!src || !src.startsWith("http")) return false;
+  if (!src || !src.startsWith('http')) return false;
   const lower = src.toLowerCase();
-  const blocked = ["icon", "logo", "btn", "profile", "emoticon", "sticker", "banner", "/ad/", "favicon", "arrow", "bullet"];
+  const blocked = ['icon','logo','btn','profile','emoticon','sticker','banner','/ad/','favicon','arrow','bullet','qr','naver_logo'];
   if (blocked.some(b => lower.includes(b))) return false;
-  const clean = src.split("?")[0];
+  const clean = src.split('?')[0];
   return !!(
     clean.match(/\.(jpg|jpeg|png|webp|gif)$/i) ||
-    src.includes("blogfiles") ||
-    src.includes("postfiles") ||
-    src.includes("pstatic.net") ||
-    src.includes("blogimg") ||
-    src.includes("mblogthumb") ||
-    src.includes("imgnews") ||
-    src.includes("newsimg")
+    src.includes('blogfiles') ||
+    src.includes('postfiles') ||
+    src.includes('pstatic.net') ||
+    src.includes('blogimg') ||
+    src.includes('mblogthumb') ||
+    src.includes('imgnews') ||
+    src.includes('newsimg')
   );
 }
 
-// 키워드로 이미지 수집
-async function collectImages(keywords) {
-  const allImages = [];
+async function collectImages(keyword, articleUrl, relatedUrls = []) {
   const seen = new Set();
+  const images = [];
 
-  for (const kw of keywords.slice(0, 3)) {
-    const encoded = encodeURIComponent(kw);
-    const urls = [
-      `https://search.naver.com/search.naver?where=news&query=${encoded}`,
-      `https://search.naver.com/search.naver?where=blog&query=${encoded}`,
-    ];
-
-    for (const searchUrl of urls) {
-      const html = await fetchHtml(searchUrl);
-      if (!html) continue;
-      const $ = cheerio.load(html);
-      $("img").each((_, el) => {
-        const src = $(el).attr("src") || $(el).attr("data-src") || $(el).attr("data-lazysrc") || "";
-        if (isValidImageUrl(src) && !seen.has(src)) {
-          seen.add(src);
-          allImages.push(src);
-        }
-      });
+  // 기사 URL 이미지 먼저
+  if (articleUrl) {
+    const article = await fetchArticle(articleUrl);
+    for (const img of article.images) {
+      if (isValidImageUrl(img) && !seen.has(img)) {
+        seen.add(img);
+        images.push(img);
+      }
     }
   }
 
-  const candidates = allImages.slice(0, 60);
-  const results = await Promise.allSettled(
-    candidates.map(async (url) => {
-      const valid = await isValidImage(url);
-      return valid ? url : null;
-    })
-  );
+  // 키워드 변형
+  const queries = [
+    keyword,
+    `${keyword} 근황`,
+    `${keyword} 사진`,
+    `${keyword} 최신`,
+  ];
 
-  return results
-    .filter(r => r.status === "fulfilled" && r.value)
-    .map(r => r.value)
-    .slice(0, 40);
+  const searchUrls = [];
+  for (const q of queries) {
+    const enc = encodeURIComponent(q);
+    searchUrls.push(`https://search.naver.com/search.naver?where=news&query=${enc}`);
+    searchUrls.push(`https://search.naver.com/search.naver?where=blog&query=${enc}`);
+    searchUrls.push(`https://search.naver.com/search.naver?where=image&query=${enc}`);
+  }
+
+  for (const url of searchUrls) {
+    if (images.length >= 150) break;
+    // 관련 URL 제외
+    if (relatedUrls.some(r => r && url.includes(r))) continue;
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          'Referer': 'https://www.naver.com/',
+        },
+        timeout: 5000,
+      });
+      const html = await res.text();
+      const $ = cheerio.load(html);
+      $('img').each((_, el) => {
+        const src =
+          $(el).attr('src') ||
+          $(el).attr('data-src') ||
+          $(el).attr('data-lazysrc') ||
+          $(el).attr('data-original') || '';
+        const cleanSrc = src.split('?')[0];
+        if (isValidImageUrl(src) && !seen.has(cleanSrc)) {
+          seen.add(cleanSrc);
+          images.push(src);
+        }
+      });
+    } catch { /* 계속 */ }
+  }
+
+  return images.slice(0, 150);
 }
 
-// 블로그 글 생성
-async function generateBlogPost(articleUrl, keyword, relatedUrls) {
-  const article = await extractArticle(articleUrl);
+// ── 블로그 생성 ────────────────────────────────────────
 
-  const relatedTitles = await Promise.all(
-    relatedUrls.filter(Boolean).map(async (url) => {
-      const title = await fetchPageTitle(url);
-      return { url, title };
-    })
-  );
+async function generateBlog(keyword, articleContent, articleTitle, relatedUrls, apiKey) {
+  const openai = new OpenAI({ apiKey });
 
-  const relatedSection = relatedTitles.length > 0
-    ? `\n함께 읽으면 좋은 글\n\n${relatedTitles.map(r => r.url).join("\n")}`
-    : "";
+  const relatedSection = relatedUrls && relatedUrls.filter(Boolean).length > 0
+    ? `\n함께 읽으면 좋은 글\n\n${relatedUrls.filter(Boolean).join('\n')}`
+    : '';
 
-  const titlePrompt = `당신은 네이버 블로그 작가입니다.
-키워드: ${keyword}
-참고 기사 제목: ${article.title || "없음"}
+  const systemMessage = `너는 네이버 블로그 작가야.
+반드시 유효한 JSON 1개만 출력해: {"title":"...","body":"...","hashtags":"..."}
 
-아래 규칙으로 블로그 제목 1개만 만들어주세요.
-- 핵심 키워드 "${keyword}"가 제목 맨 앞에 위치
-- 25~40자
-- 사람들이 클릭하고 싶게 자연스럽고 흥미롭게
-- 숫자, 반전, 궁금증 유발 요소 포함
-- 뉴스 제목처럼 딱딱하게 쓰지 말것
-- 제목만 출력, 번호나 설명 없이`;
+[절대 규칙]
+1. 소제목 반드시 5~7개. 없으면 실패.
+2. 소제목: 순수 텍스트만. 괄호() 대괄호[] 번호(1.) "소제목" 글자 절대 금지.
+3. 소제목 위 빈줄 1개, 아래 빈줄 1개 필수.
+4. 각 소제목 아래 문단 4개 이상.
+5. 각 문단 정확히 2문장. 3문장 이상 절대 금지.
+6. 문단 사이 빈줄 1개.
+7. 공백 제외 2500자 이상.
+8. 한국어만. 영어 단어 금지.
+9. 이모지 금지.
+10. 스푼지기 한입 정리 이후 소제목 절대 금지.
+11. 함께 읽으면 좋은 글 1번만 출력.`;
 
-  const title = (await callGemini(titlePrompt)).trim();
+  const userMessage = `키워드: ${keyword}
+기사 제목: ${articleTitle || '없음'}
+기사 내용: ${articleContent || '없음'}
 
-  const contentPrompt = `당신은 네이버 블로그 작가입니다.
+[출력 순서 - 절대 변경 금지]
+1. 본문 (소제목 5~7개 포함)
+2. 여러분은 어떻게 생각하셨나요?
+3. 스푼지기의 한입 정리
+4. 요약 2~3문장
+5. 오늘도 읽어주셔서 감사합니다.
+${relatedSection ? `6. 함께 읽으면 좋은 글\n\n${relatedUrls.filter(Boolean).join('\n')}` : ''}
+7. 해시태그 15개
 
-키워드: ${keyword}
-제목: ${title}
-참고 기사 내용: ${article.content || "없음"}
+[본문 형식 예시]
+첫문장이에요. 두번째문장이에요.
 
-아래 규칙으로 블로그 본문을 작성하세요.
+이 장면에서 진짜 감동받았어요
 
-문체 규칙:
-- 말투: ~인데요 / ~했어요 / ~이었습니다 / ~않나요? / ~같아요
-- 소제목 앞뒤 특수기호 사용 금지, 소제목은 텍스트만
-- 본문 전체 이모지 사용 금지
-- 공백 제외 1,500~1,800자 (절대 넘지 말것)
-- 키워드 "${keyword}"를 문장 흐름에 맞게 자연스럽게 15~20회 배치
-- 뉴스 기사 말투 절대 금지
-- 사람이 직접 쓴 것처럼 친근하고 자연스럽게
-- AI 느낌 문장 금지
-- 한 문단은 2~3문장으로 구성, 내용이 바뀔 때만 줄바꿈
-- 소제목 앞뒤 빈 줄 하나씩
+문장1이에요. 문장2에요.
 
-글 구조:
-1. 첫 문단: 2~3줄로 핵심 요약, 독자 관심 끌기
-2. 소제목 4~5개로 내용 나누기
-3. 각 소제목 아래 2~3개 짧은 문단
-4. 마지막: 독자에게 질문 한 개
-5. "오늘도 읽어주셔서 감사합니다." 로 마무리
-${relatedSection ? `6. 마지막에 아래 내용 포함:\n${relatedSection}` : ""}
+문장3이에요. 문장4에요.
 
-해시태그:
-- 본문 맨 마지막에 추가
-- 키워드 기반 네이버 검색에 잘 걸리는 태그 15개
-- 형식: #${keyword} #관련태그1 #관련태그2 한 줄로 나열
+문장5에요. 문장6이에요.
 
-본문만 출력, 제목 출력 금지`;
+문장7이에요. 문장8이에요.
 
-  const content = (await callGemini(contentPrompt)).trim();
+솔직히 이건 몰랐는데 깜짝 놀랐어요
 
-  const kwPrompt = `다음 블로그 본문에서 이미지 검색에 쓸 핵심 키워드 3개를 추출해줘.
-인물명, 장소명, 사건명 위주로.
-쉼표로 구분해서 키워드만 출력.
+문장1이에요. 문장2에요.
 
-본문: ${content.slice(0, 500)}`;
-  const kwResult = (await callGemini(kwPrompt)).trim();
-  const keywords = kwResult.split(/[,，\n]/).map(k => k.trim()).filter(Boolean).slice(0, 3);
-  if (!keywords.includes(keyword)) keywords.unshift(keyword);
+문장3이에요. 문장4에요.
 
-  return { title, content, keywords };
+문장5에요. 문장6이에요.
+
+문장7이에요. 문장8이에요.
+
+(소제목 5~7개 이런 식으로 반복)
+
+여러분은 어떻게 생각하셨나요?
+
+스푼지기의 한입 정리
+
+요약 2~3문장.
+
+오늘도 읽어주셔서 감사합니다.
+
+[소제목 규칙]
+- 블로거가 직접 느낀 감정을 구어체로
+- ~했어요 / ~더라고요 / ~않나요? 말투
+- 기사 내용에 맞게 매번 새롭게 창작
+- 절대 반복 금지
+- 번호 금지
+
+[제목] ${keyword} 맨 앞, 25~40자, 후킹 문장, 숫자/반전/궁금증 포함
+[해시태그] 정확히 15개, 첫 태그 #${keyword}, 공백으로만 구분, 쉼표 금지
+
+JSON만 출력.`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    max_tokens: 5000,
+    temperature: 1.0,
+    messages: [
+      { role: 'system', content: systemMessage },
+      { role: 'user', content: userMessage },
+    ],
+  });
+
+  const raw = response.choices[0].message.content.trim();
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('JSON 형식 오류');
+
+  const result = JSON.parse(jsonMatch[0]);
+  result.body = postProcessBody(result.body);
+  result.hashtags = cleanHashtags(result.hashtags, keyword);
+  result.charCount = countChars(result.body);
+
+  return result;
 }
 
-// ─── API 라우트 ───────────────────────────────────────
+// ── API 라우트 ─────────────────────────────────────────
 
-// 글 생성 시작
-app.post("/api/blog/generate", async (req, res) => {
-  const { articleUrl, keyword, relatedUrls = [] } = req.body;
-  if (!articleUrl || !keyword) {
-    return res.status(400).json({ error: "articleUrl과 keyword는 필수입니다." });
+// 블로그 생성 시작
+app.post('/blog', async (req, res) => {
+  const { keyword, articleUrl, relatedUrls = [], apiKey } = req.body;
+  if (!keyword || !apiKey) {
+    return res.status(400).json({ error: 'keyword와 apiKey는 필수입니다.' });
   }
 
   const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2);
-  jobs.set(jobId, { status: "pending" });
+  jobs.set(jobId, { status: 'pending', partialChars: 0 });
   res.json({ jobId });
 
   (async () => {
     try {
-      const result = await generateBlogPost(articleUrl, keyword, relatedUrls);
-      jobs.set(jobId, { status: "completed", ...result });
+      const article = await fetchArticle(articleUrl || '');
+
+      // 이미지 수집 병렬 시작
+      const imagesPromise = collectImages(keyword, articleUrl, relatedUrls);
+
+      // 블로그 생성
+      const blog = await generateBlog(
+        keyword,
+        article.content,
+        article.title,
+        relatedUrls,
+        apiKey
+      );
+
+      const images = await imagesPromise;
+
+      jobs.set(jobId, {
+        status: 'completed',
+        ...blog,
+        images,
+      });
     } catch (e) {
-      jobs.set(jobId, { status: "failed", error: e.message });
+      jobs.set(jobId, { status: 'failed', error: e.message });
     }
     setTimeout(() => jobs.delete(jobId), 3600000);
   })();
 });
 
-// 글 생성 상태 확인
-app.get("/api/blog/jobs/:jobId", (req, res) => {
-  const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "Job을 찾을 수 없습니다." });
+// 상태 조회
+app.get('/blog/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
   res.json(job);
 });
 
-// 이미지 검색
-app.post("/api/images/search", async (req, res) => {
-  const { keywords = [] } = req.body;
-  try {
-    const images = await collectImages(Array.isArray(keywords) ? keywords : [keywords]);
-    res.json({ images });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // 이미지 다운로드 프록시
-app.post("/api/images/download", async (req, res) => {
+app.post('/image/download', async (req, res) => {
   const { url } = req.body;
   try {
     const imgRes = await fetch(url, {
-      headers: { ...NAV_HEADERS, Referer: "https://blog.naver.com/" },
+      headers: {
+        'Referer': 'https://blog.naver.com/',
+        'User-Agent': 'Mozilla/5.0',
+      },
       timeout: 8000,
     });
     if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
     const buffer = await imgRes.buffer();
-    const ct = imgRes.headers.get("content-type") || "image/jpeg";
+    const ct = imgRes.headers.get('content-type') || 'image/jpeg';
     res.json({
-      base64: buffer.toString("base64"),
-      mimeType: ct.split(";")[0].trim(),
+      base64: buffer.toString('base64'),
+      mimeType: ct.split(';')[0].trim(),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -299,9 +381,9 @@ app.post("/api/images/download", async (req, res) => {
 });
 
 // SPA fallback
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`서버 실행 중: http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`서버 실행: http://localhost:${PORT}`));
